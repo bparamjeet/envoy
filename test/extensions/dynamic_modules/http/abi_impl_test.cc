@@ -482,6 +482,46 @@ TEST(ABIImpl, dynamic_metadata) {
       &filter, namespace_ptr, namespace_length, key_ptr, key_length, &result_number));
 }
 
+TEST(ABIImpl, filter_state) {
+  DynamicModuleHttpFilter filter{nullptr};
+  const std::string key_str = "key";
+  envoy_dynamic_module_type_buffer_module_ptr key_ptr = const_cast<char*>(key_str.data());
+  size_t key_length = key_str.size();
+  const std::string value_str = "value";
+  envoy_dynamic_module_type_buffer_module_ptr value_ptr = const_cast<char*>(value_str.data());
+  size_t value_length = value_str.size();
+  char* result_str_ptr = nullptr;
+  size_t result_str_length = 0;
+
+  // No stream info.
+  EXPECT_FALSE(envoy_dynamic_module_callback_http_set_filter_state_bytes(
+      &filter, key_ptr, key_length, value_ptr, value_length));
+  EXPECT_FALSE(envoy_dynamic_module_callback_http_get_filter_state_bytes(
+      &filter, key_ptr, key_length, &result_str_ptr, &result_str_length));
+
+  // With stream info but non existing key.
+  const char* non_existing_key = "non_existing";
+  envoy_dynamic_module_type_buffer_module_ptr non_existing_key_ptr =
+      const_cast<char*>(non_existing_key);
+  size_t non_existing_key_length = strlen(non_existing_key);
+  Http::MockStreamDecoderFilterCallbacks callbacks;
+  StreamInfo::MockStreamInfo stream_info;
+  EXPECT_CALL(callbacks, streamInfo()).WillRepeatedly(testing::ReturnRef(stream_info));
+  EXPECT_CALL(stream_info, filterState())
+      .WillRepeatedly(testing::ReturnRef(stream_info.filter_state_));
+  filter.setDecoderFilterCallbacks(callbacks);
+  EXPECT_TRUE(envoy_dynamic_module_callback_http_set_filter_state_bytes(
+      &filter, key_ptr, key_length, value_ptr, value_length));
+  EXPECT_FALSE(envoy_dynamic_module_callback_http_get_filter_state_bytes(
+      &filter, non_existing_key_ptr, non_existing_key_length, &result_str_ptr, &result_str_length));
+
+  // With key.
+  EXPECT_TRUE(envoy_dynamic_module_callback_http_get_filter_state_bytes(
+      &filter, key_ptr, key_length, &result_str_ptr, &result_str_length));
+  EXPECT_EQ(result_str_length, value_length);
+  EXPECT_EQ(std::string(result_str_ptr, result_str_length), value_str);
+}
+
 std::string
 bufferVectorToString(const std::vector<envoy_dynamic_module_type_envoy_buffer>& buffer_vector) {
   std::string result;
@@ -658,6 +698,93 @@ TEST(ABIImpl, ClearRouteCache) {
   EXPECT_CALL(callbacks, downstreamCallbacks())
       .WillOnce(testing::Return(OptRef(downstream_callbacks)));
   envoy_dynamic_module_callback_http_clear_route_cache(&filter);
+}
+
+TEST(ABIImpl, GetAttributes) {
+  DynamicModuleHttpFilter filter{nullptr};
+  Http::MockStreamDecoderFilterCallbacks callbacks;
+  StreamInfo::MockStreamInfo stream_info;
+  EXPECT_CALL(callbacks, streamInfo()).WillRepeatedly(testing::ReturnRef(stream_info));
+  envoy::config::core::v3::Metadata metadata;
+  EXPECT_CALL(stream_info, dynamicMetadata()).WillRepeatedly(testing::ReturnRef(metadata));
+  filter.setDecoderFilterCallbacks(callbacks);
+  EXPECT_CALL(stream_info, protocol()).WillRepeatedly(testing::Return(Http::Protocol::Http11));
+  EXPECT_CALL(stream_info, upstreamInfo()).Times(testing::AtLeast(1));
+  EXPECT_CALL(stream_info, responseCode()).WillRepeatedly(testing::Return(200));
+
+  NiceMock<StreamInfo::MockStreamInfo> info;
+  EXPECT_CALL(stream_info, downstreamAddressProvider())
+      .WillRepeatedly(testing::ReturnPointee(info.downstream_connection_info_provider_));
+  info.downstream_connection_info_provider_->setRemoteAddress(
+      Envoy::Network::Utility::parseInternetAddressNoThrow("1.1.1.1", 1234, false));
+  info.downstream_connection_info_provider_->setLocalAddress(
+      Envoy::Network::Utility::parseInternetAddressNoThrow("127.0.0.2", 4321, false));
+
+  char* result_str_ptr = nullptr;
+  size_t result_str_length = 0;
+  uint64_t result_number = 0;
+
+  // Unsupported attributes.
+  EXPECT_FALSE(envoy_dynamic_module_callback_http_filter_get_attribute_int(
+      &filter, envoy_dynamic_module_type_attribute_id_XdsListenerMetadata, &result_number));
+  EXPECT_FALSE(envoy_dynamic_module_callback_http_filter_get_attribute_string(
+      &filter, envoy_dynamic_module_type_attribute_id_XdsListenerMetadata, &result_str_ptr,
+      &result_str_length));
+
+  // Type mismatch.
+  EXPECT_FALSE(envoy_dynamic_module_callback_http_filter_get_attribute_int(
+      &filter, envoy_dynamic_module_type_attribute_id_SourceAddress, &result_number));
+  EXPECT_FALSE(envoy_dynamic_module_callback_http_filter_get_attribute_string(
+      &filter, envoy_dynamic_module_type_attribute_id_SourcePort, &result_str_ptr,
+      &result_str_length));
+
+  // envoy_dynamic_module_type_attribute_id_RequestProtocol
+  EXPECT_TRUE(envoy_dynamic_module_callback_http_filter_get_attribute_string(
+      &filter, envoy_dynamic_module_type_attribute_id_RequestProtocol, &result_str_ptr,
+      &result_str_length));
+  EXPECT_EQ(result_str_length, 8);
+  EXPECT_EQ(std::string(result_str_ptr, result_str_length), "HTTP/1.1");
+
+  // envoy_dynamic_module_type_attribute_id_UpstreamAddress
+  EXPECT_TRUE(envoy_dynamic_module_callback_http_filter_get_attribute_string(
+      &filter, envoy_dynamic_module_type_attribute_id_UpstreamAddress, &result_str_ptr,
+      &result_str_length));
+  EXPECT_EQ(result_str_length, 12);
+  EXPECT_EQ(std::string(result_str_ptr, result_str_length), "10.0.0.1:443");
+
+  // envoy_dynamic_module_type_attribute_id_SourceAddress
+  EXPECT_TRUE(envoy_dynamic_module_callback_http_filter_get_attribute_string(
+      &filter, envoy_dynamic_module_type_attribute_id_SourceAddress, &result_str_ptr,
+      &result_str_length));
+  EXPECT_EQ(result_str_length, 12);
+  EXPECT_EQ(std::string(result_str_ptr, result_str_length), "1.1.1.1:1234");
+
+  // envoy_dynamic_module_type_attribute_id_DestinationAddress
+  EXPECT_TRUE(envoy_dynamic_module_callback_http_filter_get_attribute_string(
+      &filter, envoy_dynamic_module_type_attribute_id_DestinationAddress, &result_str_ptr,
+      &result_str_length));
+  EXPECT_EQ(result_str_length, 14);
+  EXPECT_EQ(std::string(result_str_ptr, result_str_length), "127.0.0.2:4321");
+
+  // envoy_dynamic_module_type_attribute_id_ResponseCode
+  EXPECT_TRUE(envoy_dynamic_module_callback_http_filter_get_attribute_int(
+      &filter, envoy_dynamic_module_type_attribute_id_ResponseCode, &result_number));
+  EXPECT_EQ(result_number, 200);
+
+  // envoy_dynamic_module_type_attribute_id_UpstreamPort
+  EXPECT_TRUE(envoy_dynamic_module_callback_http_filter_get_attribute_int(
+      &filter, envoy_dynamic_module_type_attribute_id_UpstreamPort, &result_number));
+  EXPECT_EQ(result_number, 443);
+
+  // envoy_dynamic_module_type_attribute_id_SourcePort
+  EXPECT_TRUE(envoy_dynamic_module_callback_http_filter_get_attribute_int(
+      &filter, envoy_dynamic_module_type_attribute_id_SourcePort, &result_number));
+  EXPECT_EQ(result_number, 1234);
+
+  // envoy_dynamic_module_type_attribute_id_DestinationPort
+  EXPECT_TRUE(envoy_dynamic_module_callback_http_filter_get_attribute_int(
+      &filter, envoy_dynamic_module_type_attribute_id_DestinationPort, &result_number));
+  EXPECT_EQ(result_number, 4321);
 }
 
 } // namespace HttpFilters
